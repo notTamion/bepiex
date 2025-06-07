@@ -1,0 +1,142 @@
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+function Get-SteamCommonDirs {
+    $paths = @()
+    $default = "C:\Program Files (x86)\Steam\steamapps\common"
+    if (Test-Path $default) {
+        $paths += $default
+    }
+    $vdfPath = "C:\Program Files (x86)\Steam\steamapps\libraryfolders.vdf"
+    if (Test-Path $vdfPath) {
+        $content = Get-Content $vdfPath -Raw
+        $matches = [regex]::Matches($content, '"path"\s+"([^"]+)"')
+        foreach ($match in $matches) {
+            $libRoot = $match.Groups[1].Value
+            $libCommon = Join-Path $libRoot "steamapps\common"
+            if (Test-Path $libCommon) {
+                $paths += $libCommon
+            }
+        }
+    }
+    return $paths | Select-Object -Unique
+}
+
+function Find-UnityGames($dirs) {
+    $games = @{}
+    foreach ($dir in $dirs) {
+        Get-ChildItem -Directory -Path $dir | ForEach-Object {
+            $gamePath = $_.FullName
+            $dataFolder = Get-ChildItem -Directory -Path $gamePath -Filter "*_Data" | Where-Object {
+                Test-Path (Join-Path $_.FullName "globalgamemanagers")
+            }
+            $hasUnityDLL = Test-Path (Join-Path $gamePath "UnityPlayer.dll")
+            if ($dataFolder -or $hasUnityDLL) {
+                $games[$_.Name] = $gamePath
+            }
+        }
+    }
+    return $games
+}
+
+function Detect-Il2Cpp($gamePath) {
+    $dataDir = Get-ChildItem -Directory -Path $gamePath -Filter "*_Data" | Select-Object -First 1
+    if (-not $dataDir) { return $false }
+    $il2cpp = Join-Path $dataDir.FullName "il2cpp_data"
+    return Test-Path $il2cpp
+}
+
+function Get-BepInExReleases {
+    $url = "https://api.github.com/repos/BepInEx/BepInEx/releases"
+    return Invoke-RestMethod -Uri $url
+}
+
+function Prompt-Version($versions) {
+    Write-Host "`nAvailable BepInEx versions (latest first):`n"
+    $idMap = @{}
+    for ($i = 0; $i -lt $versions.Count; $i++) {
+        $v = $versions[$i]
+        $note = if ($v.prerelease) { " (prerelease)" } else { "" }
+        Write-Host "$($i + 1). $($v.tag_name)$note - $($v.name)"
+        $idMap["$($i + 1)"] = $v.tag_name
+    }
+    $input = Read-Host "`nEnter version number (1–$($versions.Count)) or version tag (e.g. 6.0.0-pre.2), or leave blank for latest"
+    if (-not $input) {
+        return ""
+    } elseif ($idMap.ContainsKey($input)) {
+        return $idMap[$input]
+    } else {
+        return $input.Trim()
+    }
+}
+
+function Install-BepInEx($gamePath, $version, $isIl2Cpp) {
+    $releases = Get-BepInExReleases
+    if (-not $version) {
+        $version = $releases | Select-Object -First 1 | Select-Object -ExpandProperty tag_name
+    }
+    $cleanVersion = $version.TrimStart("v")
+    $release = $releases | Where-Object { $_.tag_name -eq $version }
+    if (-not $release) {
+        throw "Could not find release $version"
+    }
+    if ($cleanVersion -like "6.*" -or $cleanVersion -match "-pre|-be") {
+        $engine = if ($isIl2Cpp) { "Unity.IL2CPP" } else { "Unity.Mono" }
+        $filename = "BepInEx-${engine}-win-x64-${cleanVersion}.zip"
+    } else {
+        $filename = "BepInEx_x64_Release.zip"
+    }
+    $asset = $release.assets | Where-Object { $_.name -eq $filename }
+    if (-not $asset) {
+        throw "Could not find asset '$filename' in release $version"
+    }
+    $tmp = New-TemporaryFile
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp.FullName
+    $extractPath = Join-Path $env:TEMP ("bepinex_" + [Guid]::NewGuid().ToString())
+    Write-Host "Extracting archive to: $extractPath"
+    Expand-Archive -LiteralPath $tmp.FullName -DestinationPath $extractPath -Force
+    $extractedItems = Get-ChildItem -Path $extractPath
+    Write-Host "Extracted items:"
+    $extractedItems | ForEach-Object { Write-Host " - $_" }
+    if ($extractedItems.Count -eq 1 -and $extractedItems[0].PSIsContainer) {
+        $sourcePath = $extractedItems[0].FullName
+        Write-Host "Single root folder detected inside archive: $sourcePath"
+    } else {
+        $sourcePath = $extractPath
+        Write-Host "Multiple files/folders extracted directly inside $extractPath"
+    }
+    Write-Host "Copying files to game directory: $gamePath"
+    Copy-Item -Path (Join-Path $sourcePath '*') -Destination $gamePath -Recurse -Force
+    Remove-Item -LiteralPath $tmp.FullName -Force
+    Remove-Item -LiteralPath $extractPath -Recurse -Force
+    Write-Host "BepInEx $version installed to $gamePath"
+}
+
+$steamDirs = Get-SteamCommonDirs
+if (-not $steamDirs -or $steamDirs.Count -eq 0) {
+    throw "Steam common directory not found."
+}
+
+$games = Find-UnityGames $steamDirs
+if ($games.Count -eq 0) {
+    throw "No Unity games found in Steam directories."
+}
+
+Write-Host "Select a Unity game to install BepInEx into:`n"
+$names = @($games.Keys)
+for ($i = 0; $i -lt $names.Count; $i++) {
+    Write-Host "$($i + 1). $($names[$i])"
+}
+
+$choice = Read-Host "Enter the number of the game to install BepInEx into"
+if ($choice -notmatch '^[0-9]+$' -or [int]$choice -lt 1 -or [int]$choice -gt $names.Count) {
+    throw "Invalid selection."
+}
+
+$gameName = $names[[int]$choice - 1]
+$gamePath = $games[$gameName]
+$isIl2Cpp = Detect-Il2Cpp $gamePath
+
+$releases = Get-BepInExReleases
+$version = Prompt-Version $releases
+
+Install-BepInEx -gamePath $gamePath -version $version -isIl2Cpp $isIl2Cpp
