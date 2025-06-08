@@ -83,7 +83,7 @@ function Install-BepInEx($gamePath, $version, $isIl2Cpp) {
         $engine = if ($isIl2Cpp) { "Unity.IL2CPP" } else { "Unity.Mono" }
         $filename = "BepInEx-${engine}-win-x64-${cleanVersion}.zip"
     } else {
-        $filename = "BepInEx_x64_Release.zip"
+        $filename = "BepInEx_win_x64_${cleanVersion}.zip"
     }
     $asset = $release.assets | Where-Object { $_.name -eq $filename }
     if (-not $asset) {
